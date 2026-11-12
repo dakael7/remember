@@ -170,7 +170,7 @@ En "reply" escribe una respuesta natural. Para acciones confirmadas devuelve tod
         reply: { type: Type.STRING, description: 'Respuesta natural que se enviará al usuario' },
         task: { type: Type.STRING, description: 'Descripción de tarea para un recordatorio confirmado' },
         remind_at_iso: { type: Type.STRING, description: 'Fecha ISO 8601 con offset; vacío si no es recordatorio' },
-        kind: { type: Type.STRING, enum: ['receivable', 'payable', 'debt', ''] },
+        kind: { type: Type.STRING, description: 'receivable, payable o debt; deja vacío si no corresponde' },
         description: { type: Type.STRING },
         counterparty: { type: Type.STRING },
         amount: { type: Type.NUMBER },
