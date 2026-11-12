@@ -8,10 +8,10 @@ Configura estas variables de entorno en el servicio:
 - `GEMINI_API_KEY`: clave de Gemini.
 - `SUPABASE_URL`: URL del proyecto Supabase.
 - `SUPABASE_SERVICE_ROLE_KEY`: clave secreta de servidor de Supabase. Guárdala solo en las variables de entorno de Render; nunca la publiques ni la pongas en código.
-- `GEMINI_MODEL` (opcional): modelo principal; por defecto, `gemini-3.8-flash`.
+- `GEMINI_MODEL` (opcional): modelo principal; por defecto, `gemini-3.5-flash-lite` para respuestas más rápidas.
 - `GEMINI_FALLBACK_MODEL` (opcional): modelo alternativo; por defecto, `gemini-3.6-flash`.
 
-Ante errores temporales de Gemini (como `503 UNAVAILABLE`), el bot reintenta la solicitud y luego prueba el modelo alternativo. Si ambos modelos siguen indisponibles, Telegram informa que el servicio está temporalmente saturado para que se pueda volver a intentar.
+Las solicitudes a Gemini tienen un tiempo límite de 15 segundos y no hacen reintentos automáticos ocultos; ante un error temporal (como `503 UNAVAILABLE`), se prueba una vez el modelo alternativo. Los saludos simples se responden sin esperar a Gemini. Si ambos modelos siguen indisponibles, Telegram informa que el servicio está temporalmente saturado para que se pueda volver a intentar. Los recordatorios vencidos se revisan cada 10 segundos.
 
 El bot también puede responder preguntas generales y mantener el contexto de la conversación para hacer preguntas aclaratorias antes de guardar recordatorios. Conserva como máximo los 12 mensajes más recientes de cada chat en Supabase.
 

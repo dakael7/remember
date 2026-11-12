@@ -21,8 +21,14 @@ app.listen(PORT, () => console.log(`Servidor escuchando en el puerto ${PORT}`));
 
 // 2. Inicialización de servicios
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  httpOptions: {
+    timeout: 15000,
+    retryOptions: { attempts: 1 }
+  }
+});
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.6-flash';
 
 function isTransientGeminiError(error) {
@@ -35,17 +41,12 @@ async function generateContentWithFallback(contents, config) {
   let lastError;
 
   for (const model of models) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        return await ai.models.generateContent({ model, contents, config });
-      } catch (error) {
-        if (!isTransientGeminiError(error)) throw error;
-        lastError = error;
-        console.warn(`Gemini ${model} no disponible (${error.status}); intento ${attempt + 1}/2.`);
-        if (attempt === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-      }
+    try {
+      return await ai.models.generateContent({ model, contents, config });
+    } catch (error) {
+      if (!isTransientGeminiError(error)) throw error;
+      lastError = error;
+      console.warn(`Gemini ${model} no disponible (${error.status}); probando respaldo si está configurado.`);
     }
   }
 
@@ -185,6 +186,9 @@ bot.on('message:text', async (ctx) => {
   if (message.startsWith('/')) {
     return ctx.reply('No reconozco ese comando. Usa /start para ver cómo puedo ayudarte.');
   }
+  if (/^(hola|buenas|buenos días|buenas tardes|buenas noches|hey|hello)[!.?]*$/i.test(message)) {
+    return ctx.reply('¡Hola! ¿En qué puedo ayudarte? También puedo agendar recordatorios si me dices qué necesitas y cuándo.');
+  }
 
   await ctx.replyWithChatAction('typing');
   try {
@@ -235,8 +239,8 @@ bot.on('callback_query:data', async (ctx) => {
   await ctx.answerCallbackQuery();
 });
 
-// 5. Planificador (Cron Job) que revisa cada minuto los recordatorios vencidos
-cron.schedule('* * * * *', async () => {
+// 5. Revisar con frecuencia los recordatorios vencidos para reducir el retraso de entrega
+cron.schedule('*/10 * * * * *', async () => {
   const now = Date.now();
   const { data: dueReminders, error } = await supabase
     .from('reminders')
