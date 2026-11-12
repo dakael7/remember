@@ -1,9 +1,17 @@
 import 'dotenv/config';
 import { Bot, InlineKeyboard } from 'grammy';
 import cron from 'node-cron';
-import Database from 'better-sqlite3';
 import express from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!supabaseUrl || !supabaseServiceRoleKey) {
+  throw new Error('Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en las variables de entorno.');
+}
+
+const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 
 // 1. Servidor web básico (exigido por Render para mantener la app activa)
 const app = express();
@@ -14,20 +22,44 @@ app.listen(PORT, () => console.log(`Servidor escuchando en el puerto ${PORT}`));
 // 2. Inicialización de servicios
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const db = new Database('reminders.db');
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.6-flash';
 
-// Crear tabla si no existe
-db.exec(`
-  CREATE TABLE IF NOT EXISTS reminders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    task TEXT NOT NULL,
-    remind_at INTEGER NOT NULL,
-    status TEXT DEFAULT 'pending'
-  )
-`);
+function isTransientGeminiError(error) {
+  const status = Number(error?.status ?? error?.error?.code);
+  return [429, 500, 502, 503, 504].includes(status);
+}
 
-// 3. Extracción inteligente con Gemini 2.5 Flash
+async function generateContentWithFallback(contents, config) {
+  const models = [...new Set([GEMINI_MODEL, GEMINI_FALLBACK_MODEL])];
+  let lastError;
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await ai.models.generateContent({ model, contents, config });
+      } catch (error) {
+        if (!isTransientGeminiError(error)) throw error;
+        lastError = error;
+        console.warn(`Gemini ${model} no disponible (${error.status}); intento ${attempt + 1}/2.`);
+        if (attempt === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+function processingErrorMessage(error, fallbackMessage) {
+  if (isTransientGeminiError(error)) {
+    return 'El servicio de IA está temporalmente saturado. Inténtalo de nuevo en unos segundos.';
+  }
+  return fallbackMessage;
+}
+
+// 3. Extracción inteligente con Gemini
 async function parseReminder(userInput, audioBuffer = null, mimeType = null) {
   const now = new Date().toLocaleString('es-VE', { timeZone: 'America/Caracas' });
 
@@ -50,21 +82,17 @@ async function parseReminder(userInput, audioBuffer = null, mimeType = null) {
     });
   }
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash',
-    contents: contents,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          is_reminder: { type: Type.BOOLEAN },
-          task: { type: Type.STRING, description: 'Descripción clara de la tarea' },
-          remind_at_iso: { type: Type.STRING, description: 'Fecha y hora en ISO 8601 con offset, ej: 2026-11-13T16:00:00-04:00' },
-          friendly_confirmation: { type: Type.STRING, description: 'Respuesta corta confirmando el recordatorio' }
-        },
-        required: ['is_reminder', 'task', 'remind_at_iso', 'friendly_confirmation']
-      }
+  const response = await generateContentWithFallback(contents, {
+    responseMimeType: 'application/json',
+    responseSchema: {
+      type: Type.OBJECT,
+      properties: {
+        is_reminder: { type: Type.BOOLEAN },
+        task: { type: Type.STRING, description: 'Descripción clara de la tarea' },
+        remind_at_iso: { type: Type.STRING, description: 'Fecha y hora en ISO 8601 con offset, ej: 2026-11-13T16:00:00-04:00' },
+        friendly_confirmation: { type: Type.STRING, description: 'Respuesta corta confirmando el recordatorio' }
+      },
+      required: ['is_reminder', 'task', 'remind_at_iso', 'friendly_confirmation']
     }
   });
 
@@ -79,7 +107,7 @@ bot.on('message:text', async (ctx) => {
     await handleAIResponse(ctx, result);
   } catch (e) {
     console.error(e);
-    await ctx.reply('Ocurrió un error procesando tu solicitud.');
+    await ctx.reply(processingErrorMessage(e, 'Ocurrió un error procesando tu solicitud.'));
   }
 });
 
@@ -96,7 +124,7 @@ bot.on('message:voice', async (ctx) => {
     await handleAIResponse(ctx, result);
   } catch (e) {
     console.error(e);
-    await ctx.reply('No pude procesar la nota de voz.');
+    await ctx.reply(processingErrorMessage(e, 'No pude procesar la nota de voz.'));
   }
 });
 
@@ -110,7 +138,13 @@ async function handleAIResponse(ctx, result) {
     return ctx.reply('No entendí bien la fecha. ¿Podrías indicarla de nuevo?');
   }
 
-  db.prepare('INSERT INTO reminders (chat_id, task, remind_at) VALUES (?, ?, ?)').run(ctx.chat.id, result.task, timestamp);
+  const { error } = await supabase.from('reminders').insert({
+    chat_id: ctx.chat.id,
+    task: result.task,
+    remind_at: timestamp
+  });
+  if (error) throw error;
+
   await ctx.reply(`✅ ${result.friendly_confirmation}`);
 }
 
@@ -118,11 +152,21 @@ async function handleAIResponse(ctx, result) {
 bot.on('callback_query:data', async (ctx) => {
   const [action, id] = ctx.callbackQuery.data.split('_');
   if (action === 'done') {
-    db.prepare("UPDATE reminders SET status = 'completed' WHERE id = ?").run(id);
+    const { error } = await supabase
+      .from('reminders')
+      .update({ status: 'completed' })
+      .eq('id', id);
+    if (error) throw error;
+
     await ctx.editMessageText(`${ctx.callbackQuery.message.text}\n\n✔️ *Completado*`, { parse_mode: 'Markdown' });
   } else if (action === 'snooze') {
     const newTime = Date.now() + 15 * 60 * 1000;
-    db.prepare("UPDATE reminders SET remind_at = ?, status = 'pending' WHERE id = ?").run(newTime, id);
+    const { error } = await supabase
+      .from('reminders')
+      .update({ remind_at: newTime, status: 'pending' })
+      .eq('id', id);
+    if (error) throw error;
+
     await ctx.editMessageText(`${ctx.callbackQuery.message.text}\n\n💤 *Pospuesto 15 minutos*`, { parse_mode: 'Markdown' });
   }
   await ctx.answerCallbackQuery();
@@ -131,7 +175,16 @@ bot.on('callback_query:data', async (ctx) => {
 // 5. Planificador (Cron Job) que revisa cada minuto los recordatorios vencidos
 cron.schedule('* * * * *', async () => {
   const now = Date.now();
-  const dueReminders = db.prepare("SELECT * FROM reminders WHERE status = 'pending' AND remind_at <= ?").all(now);
+  const { data: dueReminders, error } = await supabase
+    .from('reminders')
+    .select('id, chat_id, task')
+    .eq('status', 'pending')
+    .lte('remind_at', now);
+
+  if (error) {
+    console.error('Error consultando recordatorios vencidos:', error);
+    return;
+  }
 
   for (const rem of dueReminders) {
     const keyboard = new InlineKeyboard()
@@ -143,7 +196,14 @@ cron.schedule('* * * * *', async () => {
         parse_mode: 'Markdown',
         reply_markup: keyboard
       });
-      db.prepare("UPDATE reminders SET status = 'sent' WHERE id = ?").run(rem.id);
+
+      const { error: updateError } = await supabase
+        .from('reminders')
+        .update({ status: 'sent' })
+        .eq('id', rem.id);
+      if (updateError) {
+        console.error(`Error marcando el recordatorio ${rem.id} como enviado:`, updateError);
+      }
     } catch (err) {
       console.error('Error enviando recordatorio:', err);
     }
