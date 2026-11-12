@@ -59,52 +59,136 @@ function processingErrorMessage(error, fallbackMessage) {
   return fallbackMessage;
 }
 
-// 3. Extracción inteligente con Gemini
-async function parseReminder(userInput, audioBuffer = null, mimeType = null) {
+// 3. Asistente conversacional y creación de recordatorios
+const CONVERSATION_HISTORY_LIMIT = 12;
+
+async function getConversationHistory(chatId) {
+  const { data, error } = await supabase
+    .from('conversation_messages')
+    .select('role, content')
+    .eq('chat_id', chatId)
+    .order('id', { ascending: false })
+    .limit(CONVERSATION_HISTORY_LIMIT);
+
+  if (error) throw error;
+  return data.reverse();
+}
+
+async function saveConversationTurn(chatId, userMessage, assistantMessage) {
+  const { error: insertError } = await supabase.from('conversation_messages').insert([
+    { chat_id: chatId, role: 'user', content: userMessage },
+    { chat_id: chatId, role: 'assistant', content: assistantMessage }
+  ]);
+  if (insertError) throw insertError;
+
+  const { data: recentMessages, error: historyError } = await supabase
+    .from('conversation_messages')
+    .select('id')
+    .eq('chat_id', chatId)
+    .order('id', { ascending: false })
+    .limit(CONVERSATION_HISTORY_LIMIT);
+  if (historyError) throw historyError;
+
+  const oldestKeptId = recentMessages.at(-1)?.id;
+  if (oldestKeptId !== undefined) {
+    const { error: cleanupError } = await supabase
+      .from('conversation_messages')
+      .delete()
+      .eq('chat_id', chatId)
+      .lt('id', oldestKeptId);
+    if (cleanupError) throw cleanupError;
+  }
+}
+
+async function getAssistantResponse(chatId, userMessage, audioBuffer = null, mimeType = null) {
+  const history = await getConversationHistory(chatId);
   const now = new Date().toLocaleString('es-VE', { timeZone: 'America/Caracas' });
-
-  const prompt = `
-    Eres el asistente personal de gestión de tareas para "Remember".
-    La fecha y hora actual es: ${now} (Zona horaria: America/Caracas, UTC-4).
-    Analiza el mensaje y extrae la tarea y la fecha/hora exacta en formato ISO.
-    Si no especifica hora, asume las 09:00 AM.
-    Si no es un recordatorio, marca is_reminder como false.
-  `;
-
-  const contents = [prompt];
-  if (userInput) contents.push(userInput);
+  const contents = history.map(({ role, content }) => ({
+    role: role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: content }]
+  }));
+  const currentParts = [];
+  if (userMessage) currentParts.push({ text: userMessage });
   if (audioBuffer) {
-    contents.push({
+    currentParts.push({
       inlineData: {
         data: audioBuffer.toString('base64'),
-        mimeType: mimeType
+        mimeType
       }
     });
   }
+  contents.push({ role: 'user', parts: currentParts });
 
   const response = await generateContentWithFallback(contents, {
+    systemInstruction: `Eres Remember, un asistente personal amable que conversa en español.
+La fecha y hora actual es ${now}, en la zona horaria America/Caracas (UTC-4).
+Responde preguntas generales de forma directa y natural. No conviertas cada mensaje en un recordatorio.
+Usa intent "chat" para conversación, saludos, preguntas y respuestas que no sean para agendar.
+Usa intent "clarify" cuando el usuario quiere un recordatorio pero falta información importante, como la tarea o cuándo debe ocurrir. Haz una pregunta concreta y breve; no inventes fechas ni asumas las 09:00.
+Usa intent "reminder" solo cuando la tarea y el momento estén suficientemente claros. Interpreta mensajes cortos usando el contexto reciente, especialmente cuando el usuario responde a una pregunta de aclaración. Devuelve la fecha en ISO 8601 con offset de Caracas (-04:00).
+En "reply" escribe la respuesta que verá el usuario. En "task" pon una descripción clara solo para intent reminder. En "remind_at_iso" pon una fecha ISO solo para intent reminder; para los demás intents deja ambos campos vacíos. En "user_message_summary" resume fielmente el mensaje actual del usuario, transcribiendo la nota de voz si la hay.`,
     responseMimeType: 'application/json',
     responseSchema: {
       type: Type.OBJECT,
       properties: {
-        is_reminder: { type: Type.BOOLEAN },
-        task: { type: Type.STRING, description: 'Descripción clara de la tarea' },
-        remind_at_iso: { type: Type.STRING, description: 'Fecha y hora en ISO 8601 con offset, ej: 2026-11-13T16:00:00-04:00' },
-        friendly_confirmation: { type: Type.STRING, description: 'Respuesta corta confirmando el recordatorio' }
+        intent: { type: Type.STRING, enum: ['chat', 'clarify', 'reminder'] },
+        reply: { type: Type.STRING, description: 'Respuesta natural que se enviará al usuario' },
+        task: { type: Type.STRING, description: 'Descripción de la tarea, solo para un recordatorio confirmado' },
+        remind_at_iso: { type: Type.STRING, description: 'Fecha ISO 8601 con offset; vacío si no es un recordatorio confirmado' },
+        user_message_summary: { type: Type.STRING, description: 'Resumen del mensaje del usuario para conservar el contexto conversacional' }
       },
-      required: ['is_reminder', 'task', 'remind_at_iso', 'friendly_confirmation']
+      required: ['intent', 'reply', 'task', 'remind_at_iso', 'user_message_summary']
     }
   });
 
   return JSON.parse(response.text);
 }
 
+async function handleUserMessage(ctx, userMessage, audioBuffer = null, mimeType = null) {
+  const result = await getAssistantResponse(ctx.chat.id, userMessage, audioBuffer, mimeType);
+
+  if (result.intent === 'reminder') {
+    const timestamp = new Date(result.remind_at_iso).getTime();
+    if (!result.task || !Number.isFinite(timestamp)) {
+      throw new Error('Gemini devolvió un recordatorio sin tarea o con fecha inválida.');
+    }
+
+    const { error } = await supabase.from('reminders').insert({
+      chat_id: ctx.chat.id,
+      task: result.task,
+      remind_at: timestamp
+    });
+    if (error) throw error;
+  }
+
+  const savedUserMessage = audioBuffer ? result.user_message_summary : userMessage;
+  await saveConversationTurn(ctx.chat.id, savedUserMessage, result.reply);
+  await ctx.reply(result.reply);
+}
+
 // 4. Manejadores de mensajes en Telegram
+const usageMessage = `¡Hola! Soy Remember y puedo conversar contigo y agendar recordatorios por texto o nota de voz.
+
+Por ejemplo: "Recuérdame mañana a las 9 llamar al médico". Si falta algún dato, te preguntaré.
+Usa /help para ver estas instrucciones.`;
+
+bot.command('start', async (ctx) => {
+  await ctx.reply(usageMessage);
+});
+
+bot.command('help', async (ctx) => {
+  await ctx.reply(usageMessage);
+});
+
 bot.on('message:text', async (ctx) => {
+  const message = ctx.message.text.trim();
+  if (message.startsWith('/')) {
+    return ctx.reply('No reconozco ese comando. Usa /start para ver cómo puedo ayudarte.');
+  }
+
   await ctx.replyWithChatAction('typing');
   try {
-    const result = await parseReminder(ctx.message.text);
-    await handleAIResponse(ctx, result);
+    await handleUserMessage(ctx, message);
   } catch (e) {
     console.error(e);
     await ctx.reply(processingErrorMessage(e, 'Ocurrió un error procesando tu solicitud.'));
@@ -117,36 +201,15 @@ bot.on('message:voice', async (ctx) => {
     const file = await ctx.getFile();
     const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     const res = await fetch(fileUrl);
-    const arrayBuffer = await res.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    if (!res.ok) throw new Error(`Telegram devolvió ${res.status} al descargar la nota de voz.`);
+    const buffer = Buffer.from(await res.arrayBuffer());
 
-    const result = await parseReminder(null, buffer, 'audio/ogg');
-    await handleAIResponse(ctx, result);
+    await handleUserMessage(ctx, '[Nota de voz]', buffer, 'audio/ogg');
   } catch (e) {
     console.error(e);
     await ctx.reply(processingErrorMessage(e, 'No pude procesar la nota de voz.'));
   }
 });
-
-async function handleAIResponse(ctx, result) {
-  if (!result.is_reminder) {
-    return ctx.reply('Dime qué tarea deseas agendar y cuándo.');
-  }
-
-  const timestamp = new Date(result.remind_at_iso).getTime();
-  if (isNaN(timestamp)) {
-    return ctx.reply('No entendí bien la fecha. ¿Podrías indicarla de nuevo?');
-  }
-
-  const { error } = await supabase.from('reminders').insert({
-    chat_id: ctx.chat.id,
-    task: result.task,
-    remind_at: timestamp
-  });
-  if (error) throw error;
-
-  await ctx.reply(`✅ ${result.friendly_confirmation}`);
-}
 
 // Interacción con botones (Completar o Posponer)
 bot.on('callback_query:data', async (ctx) => {
