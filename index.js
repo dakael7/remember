@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Bot, InlineKeyboard } from 'grammy';
+import { Bot, InlineKeyboard, webhookCallback } from 'grammy';
 import cron from 'node-cron';
 import express from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
@@ -14,11 +14,23 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 
-// 1. Servidor web básico (exigido por Render para mantener la app activa)
+// 1. Servidor web para salud y webhooks de Telegram
 const app = express();
 const PORT = process.env.PORT || 3000;
+const WEBHOOK_PATH = '/telegram/webhook';
+const telegramMode = process.env.TELEGRAM_MODE || (process.env.RENDER_EXTERNAL_URL ? 'webhook' : 'polling');
+const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+const webhookUrl = process.env.TELEGRAM_WEBHOOK_URL
+  || (process.env.RENDER_EXTERNAL_URL ? `${process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '')}${WEBHOOK_PATH}` : null);
+
+if (!['webhook', 'polling'].includes(telegramMode)) {
+  throw new Error('TELEGRAM_MODE debe ser "webhook" o "polling".');
+}
+if (telegramMode === 'webhook' && (!webhookUrl || !webhookSecret || !/^[A-Za-z0-9_-]{1,256}$/.test(webhookSecret))) {
+  throw new Error('El modo webhook requiere RENDER_EXTERNAL_URL (o TELEGRAM_WEBHOOK_URL) y TELEGRAM_WEBHOOK_SECRET válido.');
+}
+
 app.get('/', (req, res) => res.send('Remember Bot activo y operativo 🚀'));
-app.listen(PORT, () => console.log(`Servidor escuchando en el puerto ${PORT}`));
 
 // 2. Inicialización de servicios
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
@@ -47,6 +59,17 @@ const ai = new GoogleGenAI({
 });
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.6-flash';
+
+if (telegramMode === 'webhook') {
+  app.use(express.json({ limit: '1mb' }));
+  app.post(
+    WEBHOOK_PATH,
+    webhookCallback(bot, 'express', {
+      secretToken: webhookSecret,
+      timeoutMilliseconds: 55_000
+    })
+  );
+}
 
 function isTransientGeminiError(error) {
   const status = Number(error?.status ?? error?.error?.code);
@@ -858,5 +881,47 @@ cron.schedule('*/10 * * * * *', async () => {
 bot.catch((error) => {
   console.error('Error procesando actualización de Telegram:', error);
 });
-bot.start();
-console.log('Bot Remember iniciado correctamente.');
+
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function startTelegram() {
+  if (telegramMode === 'webhook') {
+    let attempt = 0;
+    while (true) {
+      try {
+        await bot.api.setWebhook(webhookUrl, {
+          secret_token: webhookSecret,
+          allowed_updates: ['message', 'callback_query']
+        });
+        console.log(`Webhook de Telegram activo en ${WEBHOOK_PATH}.`);
+        return;
+      } catch (error) {
+        attempt++;
+        const wait = Math.min(30_000, 2_000 * (2 ** Math.min(attempt - 1, 4)));
+        console.error(`No se pudo configurar el webhook de Telegram (intento ${attempt}); reintento en ${wait} ms:`, error);
+        await delay(wait);
+      }
+    }
+  }
+
+  let failures = 0;
+  while (true) {
+    try {
+      await bot.start({ onStart: () => console.log('Bot Remember iniciado con long polling.') });
+      failures = 0;
+    } catch (error) {
+      failures++;
+      const wait = Math.min(60_000, 2_000 * (2 ** Math.min(failures - 1, 5)));
+      console.error(`Falló el long polling de Telegram (intento ${failures}); reintento en ${wait} ms:`, error);
+      await delay(wait);
+    }
+  }
+}
+
+app.listen(PORT, () => {
+  console.log(`Servidor escuchando en el puerto ${PORT}. Modo de Telegram: ${telegramMode}.`);
+  startTelegram().catch((error) => {
+    console.error('No se pudo iniciar el bot de Telegram:', error);
+    process.exitCode = 1;
+  });
+});
